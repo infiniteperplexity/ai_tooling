@@ -24,15 +24,6 @@ class NoMixer(nn.Module):
         return x
 
 
-class ReZero(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.resweight = nn.Parameter(torch.Tensor([0]))
-
-    def forward(self, x):
-        return x * self.resweight
-
-
 ### Norms ###
 
 class LlamaRMSNorm(nn.Module):
@@ -164,6 +155,7 @@ class GPT2AttentionMixer(nn.Module):
         x = self.attn(x)[0]
         return x
 
+# written from scratch
 class AttentionMixer(nn.Module):
     def __init__(self, model_dim, num_heads, dropout = 0.0):
         super().__init__()
@@ -228,7 +220,7 @@ class AttentionMixer(nn.Module):
 
 
 
-# Do we want this?  torch.backends.cudnn.benchmark = True?
+
 class SeqConv(nn.Module):
     def __init__(self, model_dim, kernel_size): #, num_heads = 1): ## Probably best not to mess with num_heads; I'm not sure I understood it correctly.
         super().__init__()
@@ -287,7 +279,11 @@ class MLPMixer(nn.Module):
         self.model_size = model_size
         self.expansion = expansion
         self.fc1 = nn.Linear(model_size, model_size * expansion, bias = bias)
-        self.activation = activation() if isinstance(activation, type) else activation
+        if isinstance(activation, type):
+            self.activation = activation()
+        else:
+            self.activation = activation
+
         self.fc2 = nn.Linear(model_size * expansion, model_size, bias = bias)
 
     def forward(self, x):
@@ -295,7 +291,6 @@ class MLPMixer(nn.Module):
         x = self.activation(x)
         x = self.fc2(x)
         return x
-
 
 
 class MixedHeadMixer(nn.Module):
@@ -306,7 +301,7 @@ class MixedHeadMixer(nn.Module):
 
     def forward(self, x):
         # bs, sl, d = x.shape
-        # d meeds to be split amongs the various heads. 
+        # d needs to be split amongs the various heads. 
         split = torch.split(x, [h.model_size for h in self.heads], dim = -1)
         split_out = [h(s) for h, s in zip(self.heads, split)]
         x = torch.cat(split_out, dim = -1)
@@ -359,7 +354,7 @@ class ChimeraMixer(nn.Module):
 ### Task Heads ###
 
 class CausalLanguageModelHead(nn.Module): # So this is actually kind of stupid...it's now just a classifier.
-    def __init__(self, model_size, tokenizer = None, vocab_size = None, pad_token_id = None, loss_fn = nn.CrossEntropyLoss(), tied_weights = True):
+    def __init__(self, model_size, tokenizer = None, vocab_size = None, pad_token_id = None, dropout = 0.0, loss_fn = nn.CrossEntropyLoss(), tied_weights = True):
         super().__init__()
         if tokenizer is None:
             assert vocab_size is not None, "If no tokenizer is provided, you must provide a vocab size."
@@ -373,13 +368,13 @@ class CausalLanguageModelHead(nn.Module): # So this is actually kind of stupid..
         self.vocab_size = vocab_size
         self.pad_token_id = pad_token_id
         self.fc = nn.Linear(model_size, vocab_size, bias = False)
-        #self.dropout = nn.Dropout(dropout) # this isn't a thing in GPT-2 as far as I can tell.
+        self.dropout = nn.Dropout(dropout)
         self.loss_fn = loss_fn
         self.tied_weights = tied_weights
 
     def forward(self, x):
         x = self.fc(x)
-        #x = self.dropout(x)
+        x = self.dropout(x)
         return x
 
     def tie_weights(self, wt):
@@ -388,29 +383,23 @@ class CausalLanguageModelHead(nn.Module): # So this is actually kind of stupid..
 
 
 class DownscalingLanguageModelHead(CausalLanguageModelHead):
-    def __init__(self, model_size, tokenizer = None, vocab_size = None, pad_token_id = None, dropout = 0.0, loss_fn = nn.CrossEntropyLoss(), tied_weights = True, scaling = 8, norm = nn.LayerNorm):
-        super().__init__(model_size, vocab_size = vocab_size, pad_token_id = pad_token_id, loss_fn = loss_fn, tied_weights = tied_weights, activation = nn.GELU)
+    def __init__(self, model_size, tokenizer = None, vocab_size = None, pad_token_id = None, dropout = 0.0, loss_fn = nn.CrossEntropyLoss(), tied_weights = True, scaling = 8):
+        super().__init__(model_size, vocab_size = vocab_size, pad_token_id = pad_token_id, dropout = dropout, loss_fn = loss_fn, tied_weights = tied_weights)
         self.cls_proj = nn.Linear(model_size, model_size // scaling, bias = False)
-        self.activation = activation() if isinstance(activation, type) else activation
-        self.norm = norm(model_size // scaling)
         self.fc = nn.Linear(model_size // scaling, vocab_size, bias = False)
 
     def forward(self, x):
         x = self.cls_proj(x)
-        x = self.activation(x) # as far as I can tell, ALBERT does not use dropout here but it does use an activation and a layer norm
-        x = self.norm(x)
         x = self.fc(x)
+        x = self.dropout(x)
         return x
 
 ### Initialization Strategies ###
-# I think I've talked myself into thinking this belongs here rather than with the Trainer.
-def default_weights(mdl):
-    pass
 
-# The initialization for GPT-2 is so similar to this, and no one else seems to have used it, that I think I'll ignore it.
-def init_weights_normal(mdl, mean = 0.0, std = 0.02, tokenizer = None, pad_token_id = None):
+def init_model_normal(mdl, mean = 0.0, std = 0.02, tokenizer = None, pad_token_id = None):
     if pad_token_id is None and tokenizer is not None:
         pad_token_id = tokenizer.pad_token_id
+
     for m in mdl.modules():
         if isinstance(m, torch.nn.Linear):
             m.weight.data.normal_(mean, std)
@@ -420,6 +409,7 @@ def init_weights_normal(mdl, mean = 0.0, std = 0.02, tokenizer = None, pad_token
             m.weight.data.normal_(mean, std)
             if pad_token_id is not None:
                 m.weight.data[pad_token_id].zero_()
+
 
 ### Architectural Blocks ###
 
@@ -465,43 +455,6 @@ class PostNormResidualBlock(nn.ModuleDict):
                 x = x + residual
             x = self[key](x)
         return x
-
-
-class ReZeroResidualBlock(nn.ModuleDict):
-    layer_order = ("mixer", "norm", "dropout")
-    def __init__(self, dct):
-        super().__init__()
-        for key in self.layer_order:
-            if key == "norm": # ignore whatever was passed and use ReZero
-                self[key] = ReZero()
-            elif key in dct:
-                self[key] = dct[key]
-
-    def forward(self, x):
-        residual = x
-        for key in self.layer_order:
-            x = self[key](x)
-        x = x + residual
-        return x
-
-
-class ReZeroBlockWithNorm(nn.ModuleDict):
-    layer_order = ("norm", "mixer", "rezero", "dropout")
-    def __init__(self, dct):
-        super().__init__()
-        for key in self.layer_order:
-            if key == "rezero": # ignore whatever was passed and use ReZero
-                self[key] = ReZero()
-            elif key in dct:
-                self[key] = dct[key]
-
-    def forward(self, x):
-        residual = x
-        for key in self.layer_order:
-            x = self[key](x)
-        x = x + residual
-        return x
-
 
 
 class DecoderBackbone(nn.Module):
@@ -583,9 +536,9 @@ class MixerModel(nn.Module):
         vectorizer = EmbeddingAndPositionalVectorizer,
         seq_mixer =(AttentionMixer, {"num_heads": 1}),
         ff_mixer = (MLPMixer, {"expansion": 4}),
-        norm = nn.LayerNorm,
+        norm = (nn.LayerNorm, {"elementwise_affine": False}),
         head = CausalLanguageModelHead,
-        init_strategy = (init_weights_normal, {"mean": 0.0, "std": 0.02}),
+        init_strategy = (init_model_normal, {"mean": 0.0, "std": 0.02}),
         dropout = 0.0,
         residual_block= PreNormResidualBlock,
         use_initial_norm = False,
@@ -593,11 +546,6 @@ class MixerModel(nn.Module):
         decoder_backbone = DecoderBackbone
     ):
         super().__init__()
-        ## Basic specs
-        self.model_size = model_size
-        self.num_layers = num_layers
-        self.max_seq_len = max_seq_len
-        ## Handle stuff related to tokenization
         if tokenizer is None:
             assert vocab_size is not None, "If no tokenizer is provided, you must provide a vocab size."
             if pad_token_id is None:
@@ -606,6 +554,11 @@ class MixerModel(nn.Module):
         else:
             vocab_size = tokenizer.vocab_size
             pad_token_id = tokenizer.pad_token_id
+
+        vectorizer, vectorizer_kwargs = self._unpack(vectorizer)
+        norm_init, norm_kwargs = self._unpack(norm)
+        head, head_kwargs = self._unpack(head)
+        init, init_kwargs = self._unpack(init_strategy)
         self.tokenizer = tokenizer
         if tokenizer is not None:
             self.vocab_size = tokenizer.vocab_size
@@ -613,22 +566,16 @@ class MixerModel(nn.Module):
         else:
             self.vocab_size = vocab_size
             self.pad_token_id = pad_token_id
-        ## Vectorizer
-        vectorizer, vectorizer_kwargs = self._unpack(vectorizer)
-        norm_init, norm_kwargs = self._unpack(norm)
+        self.model_size = model_size
+        self.num_layers = num_layers
+        self.max_seq_len = max_seq_len
+        self.init_strategy = init(self, tokenizer = self.tokenizer, pad_token_id = self.pad_token_id, **init_kwargs) # I honestly wonder if this should go in the Trainer instead?
         self.vectorizer = vectorizer(vocab_size, model_size, dropout = dropout, max_seq_len = max_seq_len, **vectorizer_kwargs)
-        ## Model backbone
         self.initial_norm = None if not use_initial_norm else norm_init(model_size, **norm_kwargs)        
         self.residual_block = residual_block
         self.decoder = decoder_backbone(num_layers, model_size, seq_mixer, ff_mixer, norm, dropout, residual_block)
         self.final_norm = None if not use_final_norm else norm_init(model_size, **norm_kwargs)
-        ## Task head
-        head, head_kwargs = self._unpack(head)
-        self.head = head(model_size, tokenizer = self.tokenizer, vocab_size = self.vocab_size, pad_token_id = self.pad_token_id, **head_kwargs)
-        ## Initialize weights
-        init_strategy, init_kwargs = self._unpack(init_strategy)
-        init_strategy(self, **init_kwargs)
-        ## Tie weights
+        self.head = head(model_size, tokenizer = self.tokenizer, vocab_size = self.vocab_size, pad_token_id = self.pad_token_id, dropout = dropout, **head_kwargs) # Do I need to do something to make sure the arguments don't conflict?
         if self.head.tied_weights:
             print("note: tying weights")
             self.head.tie_weights(self.vectorizer.get_tieable_weights())
@@ -638,6 +585,7 @@ class MixerModel(nn.Module):
 
     def forward(self, x):
         x = self.vectorizer(x)
+        x = self.embed_dropout(x)
         x = x if self.initial_norm is None else self.initial_norm(x)
         x = self.decoder(x)
         x = x if self.final_norm is None else self.final_norm(x)

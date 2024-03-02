@@ -1,6 +1,17 @@
-# Change log:
-# Set tf32 to True by default. 
+# So one big thing that would be a hassle is that the Trainer and Evaluator need to share state.
+# They could both hold a reference to it. 
+# They could pass it to each other.
 
+# So if I take the purely functional route of passing the state around explicitly... 
+    # I could make it a dictionary, in which case custom functions could choose to stick weird things in there, which is both good and bad in obvious ways. 
+    # I could make it a class with defined fields, and when some new obscure thing is needed, I could genuinely add it to the definition.   Okay yeah, I guess as long as I manipulate batch and output it'll always work. 
+
+
+# So let's talk about my current needs.  Right now, I can imagine functions that do slightly different things based on what epoch we are in.  But we might also want dataloaders that do that. 
+# I can imagine metrics that want to track components of losses that are not the main loss.  Those could in theory be part of "outputs" I suppose?  Actually that works really wel I think. 
+# I think curriculum learning has to be implemented with custom samplers.  So I should throw together just a length warmup to see. 
+
+# Now, let's see if I can figure out the pad_token thing.  So you can definitely...okay, got it.
 
 import torch
 import torch.nn as nn
@@ -323,10 +334,7 @@ class Trainer():
         tokenizer = None,
         epochs = 1,
         pad_token_id = -100, # if None and tokenizer is provided, will be inferred from the tokenizer
-        callbacks = [],
-        allow_tf32 = True,
-        set_grad_to_none = True,
-        autocast_dtype = torch.bfloat16, # torch.float32 for None, basically.  I'm not 100% sure everything is implemented perfectly but it seems to work.
+        callbacks = []
     ):
         self.callbacks = callbacks
         if isinstance(device, str):
@@ -371,11 +379,6 @@ class Trainer():
             )
         else:
             self.evaluator = evaluator
-        # data types and optimizations
-        self.allow_tf32 = allow_tf32
-        self.set_grad_to_none = set_grad_to_none # This seems to make no difference but I think it's strictly better
-        self.autocast_dtype = autocast_dtype
-        self.scaler = torch.cuda.amp.GradScaler(enabled = autocast_dtype != torch.float32) # I *think* it's okay to use a scaler with bf16
         # hyperparameters and training details
         self.optimizer = optimizer(model.parameters(), lr = lr, weight_decay = weight_decay)
         self.epochs = epochs
@@ -391,8 +394,6 @@ class Trainer():
 
     def train(self, epochs = None):
         epochs = epochs if epochs is not None else self.epochs
-        self._save_allowing_tf32 = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = self.allow_tf32
         for callback in self.callbacks:
             callback.on_train_begin(self)
         try:
@@ -418,27 +419,20 @@ class Trainer():
                     # Ah, I may have figured out why people don't use this.  So the problem is, if you pass a dictionary or tensors, it's not going to work.  It's going to be a problem
                     #split_batch = torch.split(train_batch, self.gradient_accumulation_batch_size, dim = 0)
                     split_batch = _split_batch(train_batch, self.train_loader.batch_size, self.gradient_accumulation_batch_size)
-                    for split in split_batch:
-                        #with torch.autocast(device_type = self.device.type, enabled = self.autocast_dtype):
-                        with torch.autocast(enabled = self.autocast_dtype != torch.float32, device_type = self.device.type, dtype = self.autocast_dtype):
-                            output = self.forward_batch(self.model, split)
-                            loss = self.batch_loss(split, output, pad_token_id = self.pad_token_id)
-                            loss_item = loss.item() # this seems like the safest way to do it
-                            if self.logger is not None: # I don't think the gradient scale affects this
-                                self.logger.accumulate_batch_metrics(split, output, loss_item) # this kind of seems like it should cause device issues but apparently it doesn't?
-                        # backward pass takes place in full precision
-                        #loss.backward()
-                        self.scaler.scale(loss).backward()
-
-                    # do the optimizer step after the accumulation
-                    self.scaler.unscale_(self.optimizer)
+                    for split in split_batch: 
+                        output = self.forward_batch(self.model, split)
+                        loss = self.batch_loss(split, output, pad_token_id = self.pad_token_id)
+                        if self.logger is not None:
+                            self.logger.accumulate_batch_metrics(split, output, loss.item()) # this kind of seems like it should cause device issues but apparently it doesn't?
+                        loss.backward()
+                    
                     if self.gradient_clipping is not None:
+                        # we might need to "unscale" here if I ever implement mixed precision
                         clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
-                    #self.optimizer.step()
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+                    # do the optimizer step after the accumulation
+                    self.optimizer.step()
                     self.scheduler.step()
-                    self.optimizer.zero_grad(set_to_none = self.set_grad_to_none)
+                    self.optimizer.zero_grad()
                     # check whether to do logging and evaluation
                     do_evaluation, do_logging = False, False
                     if train_step == len(self.train_loader):
@@ -463,7 +457,6 @@ class Trainer():
             for callback in self.callbacks:
                 callback.on_train_exit(self)
             self.clean_up_gpu()
-            torch.backends.cuda.matmul.allow_tf32 = self._save_allowing_tf32
 
 
     def reset_scheduler(self, epochs = None): # arguably should this reset training entirely?  including callbacks and initialzation?

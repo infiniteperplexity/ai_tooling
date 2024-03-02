@@ -21,13 +21,13 @@ def unpack_batch(batch, input_key = "input_ids", label_key = "labels"):
 
 def default_forward_batch(model, batch):
     x, _ = unpack_batch(batch)
-    x = x.to(model.device)
+    x = x.to(model.device, non_blocking=True)
     logits = model(x)
     return logits
 
 def multiple_choice_forward_batch(model, batch):
     input_ids, _ = unpack_batch(batch)
-    input_ids = input_ids.to(model.device)
+    input_ids = input_ids.to(model.device, non_blocking=True)
     logits = []
     for i in range(input_ids.shape[1]):
         outputs = model(input_ids=input_ids[:, i, :].squeeze(1))
@@ -48,7 +48,7 @@ def masked_cross_entropy_loss(batch, outputs, pad_token_id = -100):
     else:
         logits = outputs
 
-    labels = labels.to(logits.device)    
+    labels = labels.to(logits.device, non_blocking=True)
     #loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1), ignore_index=pad_token_id) # this is a more sensible way of doing it but for some reason it's slow as heck.
     loss_object.ignore_index = pad_token_id
     loss = loss_object(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1))
@@ -59,7 +59,7 @@ def multiple_choice_loss(batch, outputs, pad_token_id = -100):
     x, _ = unpack_batch(batch)
     labels = x[..., 1:]
     logits = outputs[..., :-1, :]
-    labels = labels.to(logits.device)    
+    labels = labels.to(logits.device, non_blocking=True)
     loss_object.ignore_index = pad_token_id
     loss = loss_object(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1))
     return loss
@@ -104,7 +104,7 @@ def masked_answer_accuracy(batch, outputs, pad_token_id = -100):
 import torch.nn.functional as F
 def multiple_choice_logprob_accuracy(batch, outputs, pad_token_id = -100):
     input_ids, labels = unpack_batch(batch)
-    input_ids = input_ids.detach().to(outputs.device)
+    input_ids = input_ids.detach().to(outputs.device, non_blocking=True)
     lm_logits = outputs.detach()[:, :, :-1, :]
     lm_labels = input_ids[:, :, 1:]
     mask = (lm_labels != pad_token_id)
@@ -114,13 +114,13 @@ def multiple_choice_logprob_accuracy(batch, outputs, pad_token_id = -100):
     sum_log_probs = masked.sum(dim=-1)
     # I tried exponentiating and also normalizing by length, but both made the results worse...this I think is what people recommend.
     preds = sum_log_probs.argmax(dim=-1)
-    labels = labels.detach().to(preds.device)
+    labels = labels.detach().to(preds.device, non_blocking=True)
     acc = (preds == labels).float().mean()
     return acc.item()
 
 
 def padded_token_counter(batch, outputs, pad_token_id = -100):
-    x, _ = unpack_batch(batch).to(outputs.device)
+    x, _ = unpack_batch(batch).to(outputs.device, non_blocking=True)
     x = x.detach() # I don't think this is actually necessary
     mask = (x != pad_token_id)
     count = mask.sum().item()

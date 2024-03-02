@@ -1,6 +1,17 @@
-# Change log:
-# Set tf32 to True by default. 
+# So one big thing that would be a hassle is that the Trainer and Evaluator need to share state.
+# They could both hold a reference to it. 
+# They could pass it to each other.
 
+# So if I take the purely functional route of passing the state around explicitly... 
+    # I could make it a dictionary, in which case custom functions could choose to stick weird things in there, which is both good and bad in obvious ways. 
+    # I could make it a class with defined fields, and when some new obscure thing is needed, I could genuinely add it to the definition.   Okay yeah, I guess as long as I manipulate batch and output it'll always work. 
+
+
+# So let's talk about my current needs.  Right now, I can imagine functions that do slightly different things based on what epoch we are in.  But we might also want dataloaders that do that. 
+# I can imagine metrics that want to track components of losses that are not the main loss.  Those could in theory be part of "outputs" I suppose?  Actually that works really wel I think. 
+# I think curriculum learning has to be implemented with custom samplers.  So I should throw together just a length warmup to see. 
+
+# Now, let's see if I can figure out the pad_token thing.  So you can definitely...okay, got it.
 
 import torch
 import torch.nn as nn
@@ -288,17 +299,75 @@ def _split_batch(batch, batch_size, new_size):
         return [batch for _ in range(n_splits)]
 
 ## Trainer class
+
+class TrainerCallback():
+    # So at some point I had the idea of passing a training/evaluation state around so that the trainer evaluator, and metrics logger could all see it. 
+    # I don't remember what ultimately came of that.  It looks like we're currently not sending step number, for example, to a state. 
+    # Now, the truth is, you're rarely if every going to want to have an evaluation callback.  But if you did, maybe you would pass an evaluation state instead of a training state?
+    # https://huggingface.co/docs/transformers/en/main_classes/callback#transformers.TrainerCallback for inspiration.
+    # The callbacks take what seem to me to be an inordinate number of arguments. But heaven forbid they see the actual Trainer itself.
+    # There's kind of an oddball object passed called TrainerControl that has these bools starting with "should_", that govern what will happen next; most notably the training might end.
+    # The docs say the that of the arguments, only the TrainerControl "can" be changed by the callback.  It's not clear whether that means it's a bad idea, or you literally can't because you receive copies, or what. 
+
+
+    def on_train_begin(self, trainer):
+        pass
+
+    def on_train_end(self, trainer):
+        pass
+
+    def on_step_begin(self, trainer):
+        pass
+
+    def on_train_exit(self, trainer):
+        pass
+
+class ResidualGatingWarmupCallback(TrainerCallback):
+    def __init__(self, warmup_steps, start_gate = 0.0, end_gate = 0.0):
+        self.warmup_steps = warmup_steps
+        self.start_gate = start_gate
+        self.end_gate = end_gate
+        self.current_gate = start_gate
+        self.hooks = []
+
+    def _hook(self):
+        def _h(module, input, output):
+            if self.current_gate < 1.0:
+                output = output * self.current_gate
+            return output
+
+    def on_train_begin(self, trainer):
+        for i, layer in enumerate(trainer.model.decoder.layers):
+            layer.seq_block(register_forward_hook(self._hook))
+            layer.ff_block.register_forward_hook(self._hook)
+            self.hooks.append(hook)
+
+    def on_step_begin(self, trainer):
+        if trainer.step < self.warmup_steps:
+            self.current_gate = self.start_gate + (self.end_gate - self.start_gate) * (trainer.step / self.warmup_steps)
+            ### Oh...it's actually kind of bad to do steps this way, because steps could be more than the number of steps in an epoch.  We might need to track a variable called total_step or global_step or something.
+        else:
+            self.current_gate = 1.0 # in theory you could remove the hooks here; I don't know if they impact performance when they're not being used.
+
+    def on_train_end(self, trainer):
+        pass
+
+    def on_train_exit(self, trainer): # So, this is a bit tricky.  We might want to save some kind of "on_train_interrupted" thing...
+        for hook in self.hooks:
+            hook.remove()
+            
+            
+    
 import gc
 import pprint
 
 from torch.nn.utils import clip_grad_norm_
+import contextlib
 
-#from dataclasses import dataclass # keep it lightweight for now
-#@dataclass
-#class TrainerState():
-    #epoch: int
-    #step: int
-    #global_step: int
+
+#Okay, so if I want to implement this residual gating warmup thing, I need to get serious about callbacks and hooks.
+# We also probably need to wrap training in a context manager, so we can clean things up when we're done, but what is the context manager here?  Does contextlib have some tools for this?
+# Oh, actually I think what you do if you don't want the whole "with" context thing is you just use try/finally.
 
 class Trainer():
     def __init__(self,
@@ -322,13 +391,8 @@ class Trainer():
         gradient_accumulation_batch_size = None,
         tokenizer = None,
         epochs = 1,
-        pad_token_id = -100, # if None and tokenizer is provided, will be inferred from the tokenizer
-        callbacks = [],
-        allow_tf32 = True,
-        set_grad_to_none = True,
-        autocast_dtype = torch.bfloat16, # torch.float32 for None, basically.  I'm not 100% sure everything is implemented perfectly but it seems to work.
+        pad_token_id = -100 # if None and tokenizer is provided, will be inferred from the tokenizer
     ):
-        self.callbacks = callbacks
         if isinstance(device, str):
             device = torch.device(device) # I think model.to() already accepts this
         self.device = device
@@ -371,11 +435,6 @@ class Trainer():
             )
         else:
             self.evaluator = evaluator
-        # data types and optimizations
-        self.allow_tf32 = allow_tf32
-        self.set_grad_to_none = set_grad_to_none # This seems to make no difference but I think it's strictly better
-        self.autocast_dtype = autocast_dtype
-        self.scaler = torch.cuda.amp.GradScaler(enabled = autocast_dtype != torch.float32) # I *think* it's okay to use a scaler with bf16
         # hyperparameters and training details
         self.optimizer = optimizer(model.parameters(), lr = lr, weight_decay = weight_decay)
         self.epochs = epochs
@@ -383,62 +442,46 @@ class Trainer():
         self.gradient_clipping = gradient_clipping
         # schedule could be a lambda, 
         self.gradient_accumulation_batch_size = gradient_accumulation_batch_size if gradient_accumulation_batch_size is not None else train_loader.batch_size
-        self.state = {
-            "epoch": 0,
-            "step": 0,
-            "global_step": 0
-        } # this will eventually probably contain a lot of things but I'm going to start slow
+        self.state = {}
 
     def train(self, epochs = None):
-        epochs = epochs if epochs is not None else self.epochs
-        self._save_allowing_tf32 = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = self.allow_tf32
-        for callback in self.callbacks:
-            callback.on_train_begin(self)
-        try:
+        epochs = epochs if epochs is not None else self.epochs ## !!! does the state need to know this stuff?  Also, should this update self.epochs?
+        try: # wrap the entire training process in a try/finally loop so we can clean up the GPU and hooks if necessary
             if self.logger is not None:
-                start_epoch = self.logger.epoch
-                self.logger.logging_timestamp = time.time()
+                start_epoch = self.logger.epoch ##!!! Should this be folded into the state?
+                self.logger.logging_timestamp = time.time() ##!!! Should this be folded into the state?
             else:
                 start_epoch = 0
             print(f"Training for {epochs} epochs starting from epoch {start_epoch + 1}; {len(self.train_loader)} steps per epoch.")
             for epoch in range(1 + start_epoch, epochs + 1 + start_epoch):
-                self.state["epoch"] = epoch
+                self.state.epoch = epoch # !!! added
                 print(f"Beginning epoch {epoch}")
-                if self.logger is not None:
+                if self.logger is not None: 
                     self.logger.epoch = epoch
                 ## Training loop
                 for train_step, train_batch in enumerate(self.train_loader, start=1):
-                    self.state["global_step"] += 1
-                    self.state["step"] = train_step
+                    self.state.step = train_step
+                    #self.state.batch = train_batch # !!! This would rarely be useful for callbacks, but at one point I was considering changing all the training functions to use the state
+                    #!!! I think for now maybe we start by only using the state for what we need to use it for.
                     self.model.train()
-                    for callback in self.callbacks:
-                        callback.on_step_begin(self)
                     # I've never seen anyone do gradient accumulation this way, with an inner loop, but it seems like it should work.
                     # Ah, I may have figured out why people don't use this.  So the problem is, if you pass a dictionary or tensors, it's not going to work.  It's going to be a problem
                     #split_batch = torch.split(train_batch, self.gradient_accumulation_batch_size, dim = 0)
                     split_batch = _split_batch(train_batch, self.train_loader.batch_size, self.gradient_accumulation_batch_size)
-                    for split in split_batch:
-                        #with torch.autocast(device_type = self.device.type, enabled = self.autocast_dtype):
-                        with torch.autocast(enabled = self.autocast_dtype != torch.float32, device_type = self.device.type, dtype = self.autocast_dtype):
-                            output = self.forward_batch(self.model, split)
-                            loss = self.batch_loss(split, output, pad_token_id = self.pad_token_id)
-                            loss_item = loss.item() # this seems like the safest way to do it
-                            if self.logger is not None: # I don't think the gradient scale affects this
-                                self.logger.accumulate_batch_metrics(split, output, loss_item) # this kind of seems like it should cause device issues but apparently it doesn't?
-                        # backward pass takes place in full precision
-                        #loss.backward()
-                        self.scaler.scale(loss).backward()
-
-                    # do the optimizer step after the accumulation
-                    self.scaler.unscale_(self.optimizer)
+                    for split in split_batch: 
+                        output = self.forward_batch(self.model, split)
+                        loss = self.batch_loss(split, output, pad_token_id = self.pad_token_id)
+                        if self.logger is not None:
+                            self.logger.accumulate_batch_metrics(split, output, loss.item()) # this kind of seems like it should cause device issues but apparently it doesn't?
+                        loss.backward()
+                    
                     if self.gradient_clipping is not None:
+                        # we might need to "unscale" here if I ever implement mixed precision
                         clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
-                    #self.optimizer.step()
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+                    # do the optimizer step after the accumulation
+                    self.optimizer.step()
                     self.scheduler.step()
-                    self.optimizer.zero_grad(set_to_none = self.set_grad_to_none)
+                    self.optimizer.zero_grad()
                     # check whether to do logging and evaluation
                     do_evaluation, do_logging = False, False
                     if train_step == len(self.train_loader):
@@ -453,20 +496,17 @@ class Trainer():
                         do_logging = True
                     # logging
                     if do_logging:
-                        self.logger.log_metrics("train", self.state["step"])
+                        self.logger.log_metrics("train", train_step)
                         self.logger.logging_timestamp = time.time()
                     ## Evaluation loop
                     if do_evaluation and self.eval_loader is not None:
                         self.evaluator.evaluate()
         finally:
-            print("running cleanup routines")
-            for callback in self.callbacks:
-                callback.on_train_exit(self)
+            # probably run some callbacks here
             self.clean_up_gpu()
-            torch.backends.cuda.matmul.allow_tf32 = self._save_allowing_tf32
 
 
-    def reset_scheduler(self, epochs = None): # arguably should this reset training entirely?  including callbacks and initialzation?
+    def reset_scheduler(self, epochs = None):
         self.epochs = epochs if epochs is not None else self.epochs
         self.scheduler = schedule(self.optimizer, len(self.train_loader) * self.epochs)
 
@@ -504,91 +544,5 @@ class Trainer():
         gc.collect()
         torch.cuda.empty_cache()
 
-
-
-## Trainer Callbacks
-# In theory some of the logging and printing functions could be rolled into callbacks.
-
-class TrainerCallback():
-    def __init__(self):
-        pass
-
-    def on_train_begin(self, trainer):
-        pass
-
-    #def on_train_end(self, trainer): # I've promised myself I won't implement things prematurely
-    #    pass
-
-    def on_train_exit(self, trainer):
-        pass
-
-    def on_step_begin(self, trainer):
-        pass
-
-
-import random
-class SimpleTestCallback(TrainerCallback):
-    def on_train_begin(self, trainer):
-        print("Test callback saw training begin.")
-    def on_train_exit(self, trainer):
-        print("Test callback saw training exit.")
-    def on_step_begin(self, trainer):
-        if random.random() < 0.01:
-            print(f"Trainer noted beginning step {trainer.state['step']} (global step {trainer.state['global_step']}) of epoch {trainer.state['epoch']}.")
-
-from functools import partial
-class ResidualGatingWarmupCallback(TrainerCallback):
-    def __init__(self, warmup_steps = 2000, start_gate = 0.0, end_gate = 1.0):
-        self.warmup_steps = warmup_steps
-        self.start_gate = start_gate
-        self.end_gate = end_gate
-        self.current_gate = start_gate
-        self.hooks = []
-
-    #def _hook(self):
-        #def _h(module, input, output):
-            #if self.current_gate < 1.0:
-                #output = output * self.current_gate
-            #return output
-
-
-    def _hook(self, module, input, output):
-        if self.current_gate < 1.0:
-            return output * self.current_gate
-        else:
-            return output
-
-    def _remove_hooks(self):
-        print("Removing hooks.")
-        for hook in self.hooks:
-            hook.remove()
-        self.hooks = []
-
-    def on_train_begin(self, trainer):
-        for i, layer in enumerate(trainer.model.decoder.layers):
-            print(f"Attaching hooks to layer {i}.")
-            #hook = layer.seq_block.register_forward_hook(self._hook())
-            hook = layer.seq_block.register_forward_hook(partial(self._hook))
-            self.hooks.append(hook)
-            #hook = layer.ff_block.register_forward_hook(self._hook())
-            hook = layer.ff_block.register_forward_hook(partial(self._hook))
-            self.hooks.append(hook)
-
-    def on_step_begin(self, trainer):
-        if trainer.state["global_step"] < self.warmup_steps:
-            self.current_gate = self.start_gate + (self.end_gate - self.start_gate) * (trainer.state["global_step"] / self.warmup_steps)
-    
-        elif trainer.state["global_step"] == self.warmup_steps:
-            self.current_gate = self.end_gate
-            self._remove_hooks()
-        else:
-            self.current_gate = self.end_gate
-
-    def on_train_exit(self, trainer):
-        self._remove_hooks()
-
- 
-            
-### Is this a good place for this?
 from transformers.models.byt5.tokenization_byt5 import ByT5Tokenizer
 ByteLevelTokenizer = ByT5Tokenizer
