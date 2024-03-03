@@ -151,42 +151,6 @@ class OneHotAndPositionalVectorizer(nn.Module):
 
 ### Sequence Mixers ###
 
-## Rotary Positional Embeddings
-# I have confirmed that the outputs are the correct shape, and that in at least one test case, the outputs are the same as the outputs from the Hugging Face implementation.
-class RoPE:
-    _cache = {}
-    @classmethod
-    def _populate_cache(cls, dim, seq_len, device, cache_key):
-        dim, period = cache_key
-        inv_freq = 1.0 / (period ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim))
-        t = torch.arange(seq_len, device = device, dtype = torch.int64).type_as(inv_freq)
-        with torch.autocast(device_type = device.type, enabled=False):
-            freqs = torch.outer(t, inv_freq)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos().to(torch.get_default_dtype())
-            sin = emb.sin().to(torch.get_default_dtype())
-        cls._cache[cache_key] = (seq_len, cos, sin)
-        
-    @classmethod
-    def _get_cached_sin_con(cls, dim, seq_len, device, period = 10_000):
-        cache_key = (dim, period)
-        if cache_key not in cls._cache or seq_len > cls._cache[cache_key][0]:
-            cls._populate_cache(dim, seq_len, device, cache_key)
-        _, cos, sin = cls._cache[cache_key]
-        return cos[:seq_len].to(device), sin[:seq_len].to(device)
-
-    @classmethod
-    def embed(cls, x, period = 10_000, head_size = None):
-        seq_len = x.size(-2)
-        device = x.device
-        dim = head_size if head_size is not None else x.size(-1)
-        cos, sin = cls._get_cached_sin_con(dim, seq_len, device, period = period)
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        rotated = torch.cat((-x2, x1), dim=-1)
-        embedded = (x * cos) + (rotated * sin)
-        return embedded
-
 ### Attention using the Hugging Face implementation of GPT2, intended for use as a reference and validation tool.
 # I have confirmed that this works identifcally to my own implementation, at least as an isolated layer.
 from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
@@ -203,12 +167,11 @@ class GPT2AttentionMixer(nn.Module):
         return x
 
 class AttentionMixer(nn.Module):
-    def __init__(self, model_dim, num_heads, dropout = 0.0, apply_rope = False):
+    def __init__(self, model_dim, num_heads, dropout = 0.0):
         super().__init__()
         self.model_dim = model_dim
         self.num_heads = num_heads
         self.head_dim = model_dim // num_heads
-        self.apply_rope = apply_rope
         self.k_proj = nn.Linear(model_dim, model_dim, bias = False)
         self.q_proj = nn.Linear(model_dim, model_dim, bias = False)
         self.softmax = nn.Softmax(dim = -1)
@@ -227,10 +190,6 @@ class AttentionMixer(nn.Module):
         keys = keys.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         queries = queries.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         values = values.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        # RoPE
-        if self.apply_rope:
-            queries = RoPE.embed(queries, head_size = self.head_dim)
-            keys = RoPE.embed(keys, head_size = self.head_dim)
         # compute attention
         attn = (queries @ keys.transpose(-1, -2)) / self.head_dim**0.5
         # apply causal mask
