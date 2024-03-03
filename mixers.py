@@ -6,6 +6,9 @@ import torch.nn.functional as F
 
 ### Dummies ###
 
+def no_activation(x):
+    return x
+
 class NoNorm(nn.Module):
     def __init__(self, model_size):
         super().__init__()
@@ -324,8 +327,7 @@ class GatedConvSeqMixer(nn.Module):
 ### State Mixers ###
 
 class MLPMixer(nn.Module):
-    #def __init__(self, model_size, expansion = 4, bias = False, activation = F.gelu):
-    def __init__(self, model_size, expansion = 4, bias = False, activation = nn.GELU):
+    def __init__(self, model_size, expansion = 4, bias = False, activation = F.gelu):
         super().__init__()
         self.model_size = model_size
         self.expansion = expansion
@@ -357,23 +359,24 @@ class MixedHeadMixer(nn.Module):
 
 
 class GatedStateMixer(nn.Module): # I'm pretty sure that things like SwiGLU already do this.
-    def __init__(self, model_size, expansion = 4, bias = False, activation = F.gelu):
+    def __init__(self, model_size, expansion = 4, bias = False, gate_activation = F.silu, up_activation = no_activation):
         super().__init__()
         self.model_size = model_size
         self.expansion = expansion
-        self.fc1 = nn.Linear(model_size, model_size * expansion, bias = bias)
+        self.upscale = nn.Linear(model_size, model_size * expansion, bias = bias)
+        self.up_activation = up_activation
         self.gate = nn.Linear(model_size, model_size * expansion)
-        self.fc2 = nn.Linear(model_size * expansion, model_size, bias = bias)
-        self.activation = activation
+        self.gate_activation = gate_activation
+        self.downscale = nn.Linear(model_size * expansion, model_size, bias = bias)
 
     def forward(self, x):
-        up = self.fc1(x)
+        up = self.upscale(x)
+        up = self.up_activation(up)
         gate = self.gate(x)
-        gate = self.activation(gate)
+        gate = self.gate_activation(gate)
         x = up * gate
-        x = self.fc2(x)
+        x = self.downscale(x)
         return x
-
 
 ### Generalized Mixers ###
 
@@ -691,5 +694,6 @@ class MixerModel(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
-    def num_parameters(self):
-        return sum(p.numel() for p in self.parameters())
+    def num_parameters(self, include_embeddings = True):
+        params = [param for param in self.parameters()  if include_embeddings or not param.shape[0] == self.vocab_size]
+        return sum(param.numel() for param in params)

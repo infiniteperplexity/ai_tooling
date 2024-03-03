@@ -68,7 +68,7 @@ from torch.optim.lr_scheduler import LambdaLR
 def constant_schedule(optimizer, total_steps):
     return LambdaLR(optimizer, lambda step: 1.0)
 
-def get_linear_schedule_with_warmup(end_factor = 0.1, warmup_steps = 2000, end_step = None):
+def get_linear_schedule(end_factor = 0.1, warmup_steps = 2000, end_step = None):
     def _f(optimizer, total_steps):
         nonlocal end_step
         if end_step is None:
@@ -80,13 +80,6 @@ def get_linear_schedule_with_warmup(end_factor = 0.1, warmup_steps = 2000, end_s
                 return end_factor + (1.0 - end_factor) * (1.0 - (step - warmup_steps) / (end_step - warmup_steps))
         return LambdaLR(optimizer, _g)
     return _f
-
-def get_warmup_schedule(warmup_steps = 2000):
-    return get_linear_schedule_with_warmup(end_factor = 1.0, warmup_steps = warmup_steps)
-
-def get_linear_schedule(end_factor = 0.1, end_step = None):
-    return get_linear_schedule_with_warmup(end_factor = end_factor, warmup_steps = 0, end_step = end_step)
-
 
 ## Metric functions
 
@@ -207,19 +200,6 @@ class MetricsLogger():
         for k in self.batch_metrics:
             self.batch_metrics[k] = []
 
-
-    def get_latest_train_row(self):
-        for row in reversed(self.log):
-            if row["mode"] == "train":
-                return row
-        return None
-
-    def get_latest_eval_row(self):
-        for row in reversed(self.log):
-            if row["mode"] == "eval":
-                return row
-        return None
-
 ## Evaluator class
 class Evaluator():
     def __init__(
@@ -319,8 +299,6 @@ class TrainerState():
     epoch: int
     step: int
     global_step: int
-    should_log: bool
-    should_evaluate: bool
     should_training_stop: bool
 
 class Trainer():
@@ -410,8 +388,6 @@ class Trainer():
             epoch = 0,
             step = 0,
             global_step = 0,
-            should_log = False,
-            should_evaluate = False,
             should_training_stop = False
         )
         # this will eventually probably contain a lot of things but I'm going to start slow
@@ -438,14 +414,15 @@ class Trainer():
                 for train_step, train_batch in enumerate(self.train_loader, start=1):
                     self.state.global_step += 1
                     self.state.step = train_step
-                    self.state.should_log = False
-                    self.state.should_evaluate = False
                     self.model.train()
                     for callback in self.callbacks:
                         callback.on_step_begin(self)
-                    # We're going to have to be careful about input formats here, to make sure splitting is supported properly.
+                    # I've never seen anyone do gradient accumulation this way, with an inner loop, but it seems like it should work.
+                    # Ah, I may have figured out why people don't use this.  So the problem is, if you pass a dictionary or tensors, it's not going to work.  It's going to be a problem
+                    #split_batch = torch.split(train_batch, self.gradient_accumulation_batch_size, dim = 0)
                     split_batch = _split_batch(train_batch, self.train_loader.batch_size, self.gradient_accumulation_batch_size)
                     for split in split_batch:
+                        #with torch.autocast(device_type = self.device.type, enabled = self.autocast_dtype):
                         with torch.autocast(enabled = self.autocast_dtype != torch.float32, device_type = self.device.type, dtype = self.autocast_dtype):
                             output = self.forward_batch(self.model, split)
                             loss = self.batch_loss(split, output, pad_token_id = self.pad_token_id)
@@ -453,6 +430,7 @@ class Trainer():
                             if self.logger is not None: # I don't think the gradient scale affects this
                                 self.logger.accumulate_batch_metrics(split, output, loss_item) # this kind of seems like it should cause device issues but apparently it doesn't?
                         # backward pass takes place in full precision
+                        #loss.backward()
                         self.scaler.scale(loss).backward()
 
                     # do the optimizer step after the accumulation
@@ -464,32 +442,31 @@ class Trainer():
                     self.scaler.update()
                     self.scheduler.step()
                     self.optimizer.zero_grad(set_to_none = self.set_grad_to_none)
-                    # on_step_end is called before logging and evaluation
+                    # check whether to do logging and evaluation...should these be folded into trainer state?
+                    self.state.should_log = False
+                    self.state.should_evaluate = False # doing this will make it so you can't specify logging or evaluation at the beginning of the step.
+                    
+                    do_evaluation, do_logging = False, False
+                    if train_step == len(self.train_loader):
+                        do_logging = True
+                        do_evaluation = True
+                    # if we are about to evaluate, log as well
+                    elif self.eval_every is not None and train_step % self.eval_every == 0:
+                        do_logging = True
+                        do_evaluation = True
+                    # otherwise check logging frequency
+                    elif self.log_every is not None and train_step % self.log_every == 0:
+                        do_logging = True
+                    # logging
+                    if do_logging:
+                        self.logger.log_metrics("train", self.state.step)
+                        self.logger.logging_timestamp = time.time()
+
                     for callback in self.callbacks:
                         callback.on_step_end(self)
                     ## Evaluation loop
-                    # arguably, this stuff should be folded into the callback system
-                    if train_step == len(self.train_loader):
-                        self.state.should_log = True
-                        self.state.should_evaluate = True
-                    # if we are about to evaluate, log as well
-                    elif self.eval_every is not None and train_step % self.eval_every == 0:
-                        self.state.should_log = True
-                        self.state.should_evaluate = True
-                    # otherwise check logging frequency
-                    elif self.log_every is not None and train_step % self.log_every == 0:
-                        self.state.should_log = True
-                    # Logging
-                    if self.state.should_log:
-                        self.logger.log_metrics("train", self.state.step)
-                        self.logger.logging_timestamp = time.time()
-                        for callback in self.callbacks:
-                            callback.on_after_log(self)
-                    # Evaluation
-                    if self.state.should_evaluate and self.eval_loader is not None:
+                    if do_evaluation and self.eval_loader is not None:
                         self.evaluator.evaluate()
-                        for callback in self.callbacks:
-                            callback.on_after_eval(self)
 
                     # end of batch
                     if self.state.should_training_stop:
@@ -563,15 +540,6 @@ class TrainerCallback():
     def on_step_begin(self, trainer):
         pass
 
-    def on_step_end(self, trainer):
-        pass
-
-    def on_after_log(self, trainer):
-        pass
-
-    def on_after_eval(self, trainer):
-        pass
-
 
 import random
 class SimpleTestCallback(TrainerCallback):
@@ -583,71 +551,6 @@ class SimpleTestCallback(TrainerCallback):
         if random.random() < 0.01:
             print(f"Trainer noted beginning step {trainer.state.step} (global step {trainer.state.global_step}) of epoch {trainer.state.epoch}.")
 
-import time
-class TimedStoppingCallback(TrainerCallback):
-    def __init__(self, max_seconds, on_after_log = True):
-        self.max_seconds = max_seconds
-        ## if on_after_log is True, the callback will wait until after logging to check the accumulated training time.  If False, it will check at the end of everyt training step.
-        self.on_after_log_ = on_after_log
-
-    def on_step_end(self, trainer):
-        if self.on_after_log_:
-            return
-        log = trainer.logger.get_latest_train_row()
-        accumulated_time = 0 if log is None else log["total_s"]
-        additional_time = time.time() - trainer.logger.logging_timestamp
-        if accumulated_time + additional_time >= self.max_seconds:
-            trainer.state.should_training_stop = True
-            trainer.state.should_log = True
-            trainer.state.should_eval = True
-            print("training ended by early stopping callback")
-
-    def on_after_log(self, trainer):
-        if not self.on_after_log_:
-            return
-        log = trainer.logger.get_latest_train_row()
-        if log is not None and log["total_s"] >= self.max_seconds:
-            trainer.state.should_training_stop = True
-            trainer.state.should_eval = True
-            print("training ended by early stopping callback")
-
-
-
-
-class LoggerMetricCallback(TrainerCallback):
-    def __init__(self, metric = "ppl", threshold = None, less_than = True, on_after_eval = False):
-        assert threshold is not None
-        self.metric = metric
-        self.threshold = threshold
-        self.less_than = less_than
-        self.on_after_eval_ = on_after_eval
-
-    def on_after_log(self, trainer):
-        if self.on_after_eval_:
-            return
-        log = trainer.logger.get_latest_train_row()
-        if log is not None:
-            if (self.less_than and log[self.metric] <= self.threshold) or (not self.less_than and log[self.metric] >= self.threshold):
-                trainer.state.should_training_stop = True
-                trainer.state.should_eval = True
-                print(f"training ended by metric callback on metric {self.metric} with value {log[self.metric]}")
-
-
-    def on_after_eval(self, trainer):
-        if not self.on_after_eval_:
-            return
-        log = trainer.logger.get_latest_eval_row()
-        if log is not None:
-            if (self.less_than and log[self.metric] <= self.threshold) or (not self.less_than and log[self.metric] >= self.threshold):
-                trainer.state.should_training_stop = True
-                print(f"training ended by metric callback on metric {self.metric} with value {log[self.metric]}")
-
-
-class PerplexityStoppingCallback(LoggerMetricCallback):
-    def __init__(self, threshold, on_after_eval = False):
-        super().__init__("ppl", threshold, True, on_after_eval)
-                
-                
 from functools import partial
 class ResidualGatingWarmupCallback(TrainerCallback):
     def __init__(self, warmup_steps = 2000, start_gate = 0.0, end_gate = 1.0):
