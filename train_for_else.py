@@ -502,10 +502,11 @@ class Trainer():
                     # end of batch
                     if self.state.should_training_stop:
                         break ## This should probably be a break to a specific label
-                # end of epoch
+                # for-else does not execute if the loop is broken out of
                 else:
                     continue # if the loop was not broken, go to the next epoch
                 break # if the inner loop was broken, also break the outer loop
+                # end of epoch
 
         finally:
             print("running cleanup routines")

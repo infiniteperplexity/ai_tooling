@@ -217,7 +217,7 @@ class AttentionMixer(nn.Module):
         self.softmax = nn.Softmax(dim = -1)
         self.v_proj = nn.Linear(model_dim, model_dim, bias = False)
         self.out_proj = nn.Linear(model_dim, model_dim, bias = False)
-        for weights in [self.k_proj, self.q_proj, self.v_proj, self.out_proj]:
+        for weights in [self.k_proj, self.q_proj, self.v_proj, self.out_proj]: # why did I have to do this here again?
             nn.init.normal_(weights.weight, std = 0.02)
         self.dropout = nn.Dropout(dropout)
         
@@ -271,6 +271,89 @@ class AttentionMixer(nn.Module):
     @classmethod
     def clear_causal_mask_cache(cls):
         cls._cached_causal_masks = {}
+
+import pynvml
+def print_gpu_utilization():
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+    info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+    print(f"GPU memory occupied: {info.used//1024**2} MB.")
+
+import math
+class LinearAttentionMixer(nn.Module):
+    def __init__(self, model_dim, num_heads, apply_rope = False, feature_map = None, eps = 1e-12):
+        super().__init__()
+        self.model_dim = model_dim
+        self.num_heads = num_heads
+        self.head_dim = model_dim // num_heads
+        self.apply_rope = apply_rope
+        self.k_proj = nn.Linear(model_dim, model_dim, bias = False)
+        self.q_proj = nn.Linear(model_dim, model_dim, bias = False)
+        self.feature_map = feature_map if feature_map is not None else self.identity_map
+        self.v_proj = nn.Linear(model_dim, model_dim, bias = False)
+        self.out_proj = nn.Linear(model_dim, model_dim, bias = False)
+        for weights in [self.k_proj, self.q_proj, self.v_proj, self.out_proj]: # copying this from the normal attention mixer, but I don't remember why it's a thing.
+            nn.init.normal_(weights.weight, std = 0.02)
+        self.eps = eps
+
+    @classmethod
+    def identity_map(cls, x, head_dim):
+        return x
+
+    _cached_sqrts = {}
+    @classmethod
+    def _cached_sqrt(cls, x):
+        if x not in cls._cached_sqrts:
+            cls._cached_sqrts[x] = math.sqrt(x)
+        return cls._cached_sqrts[x]
+
+
+    @classmethod
+    def taylor_expansion(cls, x, head_dim):
+        """ assume inputs (b, h, l, d) """ 
+        device = x.device
+        _1 = torch.ones(x[:,:,:,:1].shape, device = device)
+        _x = x / cls._cached_sqrt(cls._cached_sqrt(head_dim))
+        _x2 = (x.unsqueeze(-1) * x.unsqueeze(-2)).flatten(start_dim=-2) / cls._cached_sqrt(2*head_dim)
+        return torch.cat([_1, _x, _x2], dim=-1)
+
+
+    @classmethod
+    def pos_elu(cls, x, head_dim):
+        # this is suppsed to get multiplied by a temperature that defaults to 1 but I'm not going to do that unless it looks promising
+        return F.elu(x) + 1
+
+    @classmethod
+    def relu(cls, x, head_dim):
+        return F.relu(x).clamp(min=1e-12)
+
+    def forward(self, x):
+        keys = self.k_proj(x)
+        queries = self.q_proj(x)
+        values = self.v_proj(x)
+        # split into heads
+        batch_size, seq_len, model_dim = x.shape
+        keys = keys.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        queries = queries.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        values = values.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # RoPE...I assume this is allowed for linear attention, and I assume it comes before the feature map.
+        if self.apply_rope:
+            queries = RoPE.embed(queries, head_size = self.head_dim)
+            keys = RoPE.embed(keys, head_size = self.head_dim)
+        # apply feature maps
+        queries = self.feature_map(queries, self.head_dim)
+        keys = self.feature_map(keys, self.head_dim)
+        # compute linear attention
+        queries, keys, values =  queries.unsqueeze(-2), keys.unsqueeze(-2), values.unsqueeze(-1)
+        # Taking the product of the keys and values crashes the kernel.
+        attn = ((queries * (keys * values).cumsum(dim=2)).sum(dim=-1) / ((queries * keys).cumsum(dim=2)).sum(dim=-1) + self.eps) # the non-causal version of this just uses sums instead of cumsums
+        # merge heads
+        attn = attn.transpose(1, 2).contiguous()
+        attn = attn.view(batch_size, seq_len, model_dim)
+        # apply output projection
+        out = self.out_proj(attn)
+        return out
+
 
 
 
@@ -331,9 +414,10 @@ class MLPMixer(nn.Module):
         super().__init__()
         self.model_size = model_size
         self.expansion = expansion
-        self.fc1 = nn.Linear(model_size, model_size * expansion, bias = bias)
+        hidden_dim = int(model_size * expansion)
+        self.fc1 = nn.Linear(model_size, hidden_dim, bias = bias)
         self.activation = activation() if isinstance(activation, type) else activation
-        self.fc2 = nn.Linear(model_size * expansion, model_size, bias = bias)
+        self.fc2 = nn.Linear(hidden_dim, model_size, bias = bias)
 
     def forward(self, x):
         x = self.fc1(x)
@@ -363,11 +447,12 @@ class GatedStateMixer(nn.Module): # I'm pretty sure that things like SwiGLU alre
         super().__init__()
         self.model_size = model_size
         self.expansion = expansion
-        self.upscale = nn.Linear(model_size, model_size * expansion, bias = bias)
+        hidden_dim = int(model_size * expansion)
+        self.upscale = nn.Linear(model_size, hidden_dim, bias = bias)
         self.up_activation = up_activation
-        self.gate = nn.Linear(model_size, model_size * expansion)
+        self.gate = nn.Linear(model_size, hidden_dim)
         self.gate_activation = gate_activation
-        self.downscale = nn.Linear(model_size * expansion, model_size, bias = bias)
+        self.downscale = nn.Linear(hidden_dim, model_size, bias = bias)
 
     def forward(self, x):
         up = self.upscale(x)
@@ -615,8 +700,57 @@ class CyclingDecoderBackbone(nn.Module):
     def _unpack(self, x):
         return x if isinstance(x, tuple) else (x, {})
 
+# I'm trying to figure out how to implement the alternating decoder backbone, because there are at least two recent models that use such a setup, and also I have a specific thing to baseline. 
+# I think it makes sense to simply assume a list of unpackable arguements.
+# The problem...oh...actually...
+class AlternatingDecoderBackbone(nn.Module):
+    def __init__(self, num_layers, model_size, seq_mixer, ff_mixer, norm, dropout, residual_block):
+        super().__init__()
+        # repeat these sequences up until the number of layers is reached or exceeded.
+        if not isinstance(seq_mixer, list):
+            seq_mixer = [seq_mixer]
+        if not isinstance(ff_mixer, list):
+            ff_mixer = [ff_mixer]
+        seq_mixers_kwargs = []
+        while len(seq_mixers_kwargs) < num_layers:
+            seq_mixers_kwargs += [self._unpack(x) for x in seq_mixer]
+        ff_mixers_kwargs = []
+        while len(ff_mixers_kwargs) < num_layers:
+            ff_mixers_kwargs += [self._unpack(x) for x in ff_mixer]
+        norm, norm_kwargs = self._unpack(norm)
+        self.model_size = model_size
+        self.num_layers = num_layers
+        self.layers = nn.ModuleList()
+        for i in range(num_layers):
+            seq_mixer_, seq_mixer_kwargs = seq_mixers_kwargs[i]
+            ff_mixer_, ff_mixer_kwargs = ff_mixers_kwargs[i]
+            seq_block = residual_block({
+                "mixer": seq_mixer_(self.model_size, **seq_mixer_kwargs),
+                "dropout": nn.Dropout(dropout),
+                "norm": norm(self.model_size, **norm_kwargs)
+            })
+            ff_block = residual_block({
+                "mixer": ff_mixer_(self.model_size, **ff_mixer_kwargs),
+                "dropout": nn.Dropout(dropout),
+                "norm": norm(self.model_size, **norm_kwargs)
+            })
+            layer = LayerBlock({
+                "seq_block": seq_block,
+                "ff_block": ff_block,
+            })
+            self.layers.append(layer)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+    def _unpack(self, x):
+        return x if isinstance(x, tuple) else (x, {})
+
 
 ### Base class, more-or-less tested
+from functools import partial
 class MixerModel(nn.Module):
     def __init__(
         self,
@@ -673,7 +807,8 @@ class MixerModel(nn.Module):
         self.head = head(model_size, tokenizer = self.tokenizer, vocab_size = self.vocab_size, pad_token_id = self.pad_token_id, **head_kwargs)
         ## Initialize weights
         init_strategy, init_kwargs = self._unpack(init_strategy)
-        init_strategy(self, **init_kwargs)
+        self.init_strategy = partial(init_strategy, **init_kwargs)
+        self.initialize()
         ## Tie weights
         if self.head.tied_weights:
             print("note: tying weights")
@@ -681,6 +816,11 @@ class MixerModel(nn.Module):
 
     def _unpack(self, x):
         return x if isinstance(x, tuple) else (x, {})
+
+    def initialize(self, init_strategy = None, **kwargs):
+        if init_strategy is not None:
+            self.init_strategy = partial(init_strategy, **kwargs)
+        self.init_strategy(self)
 
     def forward(self, x):
         x = self.vectorizer(x)
