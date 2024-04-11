@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time
+# Should I investigate torch.backends.cudnn.benchmark as an optimization?  Supposedly good when input sizes are constant.
+
 
 def unpack_batch(batch, input_key = "input_ids", label_key = "labels"):
     if isinstance(batch, tuple):

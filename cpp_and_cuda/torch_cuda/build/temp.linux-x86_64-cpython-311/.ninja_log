@@ -1,0 +1,3 @@
+# ninja log v5
+0	14422	1710610399972389766	/home/perplexity/Documents/GitHub/ai_tooling/cpp_and_cuda/torch_cuda/build/temp.linux-x86_64-cpython-311/lltm_cuda.o	e60ccefcb7678572
+1	46012	1710610431549907258	/home/perplexity/Documents/GitHub/ai_tooling/cpp_and_cuda/torch_cuda/build/temp.linux-x86_64-cpython-311/lltm_cuda_kernel.o	c6c167131a945992

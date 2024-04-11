@@ -4,6 +4,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+### Causal Masking ###
+
+## Basically not implemented as a class yet...we need to at least implement this in several classes so we understand how to generalize.
+class CausalMasks:
+    _cache = {}
+
 ### Dummies ###
 
 def no_activation(x):
@@ -280,8 +287,10 @@ def print_gpu_utilization():
     print(f"GPU memory occupied: {info.used//1024**2} MB.")
 
 import math
+from fast_transformers.causal_product import causal_dot_product as causal_dot_product_cpu
+from causal_attention import causal_dot_product as causal_dot_product_cuda
 class LinearAttentionMixer(nn.Module):
-    def __init__(self, model_dim, num_heads, apply_rope = False, feature_map = None, eps = 1e-12):
+    def __init__(self, model_dim, num_heads, apply_rope = False, feature_map = None, eps = 1e-12): # should probably parameterize which version of the function to use?
         super().__init__()
         self.model_dim = model_dim
         self.num_heads = num_heads
@@ -344,17 +353,49 @@ class LinearAttentionMixer(nn.Module):
         queries = self.feature_map(queries, self.head_dim)
         keys = self.feature_map(keys, self.head_dim)
         # compute linear attention
-        queries, keys, values =  queries.unsqueeze(-2), keys.unsqueeze(-2), values.unsqueeze(-1)
-        # Taking the product of the keys and values crashes the kernel.
-        attn = ((queries * (keys * values).cumsum(dim=2)).sum(dim=-1) / ((queries * keys).cumsum(dim=2)).sum(dim=-1) + self.eps) # the non-causal version of this just uses sums instead of cumsums
+        # hold on...they seem to do the head-splitting after the feature map.
+        if keys.device.type == "cuda":
+            causal_dot_product = causal_dot_product_cuda
+        else:
+            causal_dot_product = causal_dot_product_cpu
+            
+        if causal_dot_product is not None: # trying to use the logic from the fast_transformers library
+            Z = 1/(torch.einsum("nlhi,nlhi->nlh", queries, keys.cumsum(1)) + self.eps)
+            attn = causal_dot_product(
+                queries.permute(0,2,1,3).contiguous(),
+                keys.permute(0,2,1,3).contiguous(),
+                values.permute(0,2,1,3).contiguous()
+            ).permute(0,2,1,3).contiguous()
+            attn = attn * Z[:, :, :, None].contiguous()
+        else:
+            queries, keys, values =  queries.unsqueeze(-2), keys.unsqueeze(-2), values.unsqueeze(-1)
+            attn = ((queries * (keys * values).cumsum(dim=2)).sum(dim=-1) / ((queries * keys).cumsum(dim=2)).sum(dim=-1) + self.eps) # the non-causal version of this just uses sums instead of cumsums
+            attn = attn.transpose(1, 2).contiguous()
         # merge heads
-        attn = attn.transpose(1, 2).contiguous()
         attn = attn.view(batch_size, seq_len, model_dim)
         # apply output projection
         out = self.out_proj(attn)
         return out
+    
+# in testing
+from mamba_ssm import Mamba
+class MambaMixer(nn.Module):
+    def __init__(self, model_dim, d_state = 16, d_conv = 4, expand = 2):
+        super().__init__()
+        self.model_dim = model_dim
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.mamba = Mamba(
+            d_model = model_dim,
+            d_state = d_state,
+            d_conv = d_conv,
+            expand = expand
+        )
 
-
+    def forward(self, x):
+        x = self.mamba(x)
+        return x
 
 
 # Do we want this?  torch.backends.cudnn.benchmark = True?
