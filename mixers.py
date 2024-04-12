@@ -287,8 +287,8 @@ def print_gpu_utilization():
     print(f"GPU memory occupied: {info.used//1024**2} MB.")
 
 import math
-from fast_transformers.causal_product import causal_dot_product as causal_dot_product_cpu
-from causal_attention import causal_dot_product as causal_dot_product_cuda
+from fast_transformers.causal_product import causal_dot_product
+#from causal_attention import causal_dot_product as causal_dot_product_cuda
 class LinearAttentionMixer(nn.Module):
     def __init__(self, model_dim, num_heads, apply_rope = False, feature_map = None, eps = 1e-12): # should probably parameterize which version of the function to use?
         super().__init__()
@@ -298,7 +298,8 @@ class LinearAttentionMixer(nn.Module):
         self.apply_rope = apply_rope
         self.k_proj = nn.Linear(model_dim, model_dim, bias = False)
         self.q_proj = nn.Linear(model_dim, model_dim, bias = False)
-        self.feature_map = feature_map if feature_map is not None else self.identity_map
+        #self.feature_map = feature_map if feature_map is not None else self.identity_map
+        self.feature_map = feature_map if feature_map is not None else self.pos_elu
         self.v_proj = nn.Linear(model_dim, model_dim, bias = False)
         self.out_proj = nn.Linear(model_dim, model_dim, bias = False)
         for weights in [self.k_proj, self.q_proj, self.v_proj, self.out_proj]: # copying this from the normal attention mixer, but I don't remember why it's a thing.
@@ -354,18 +355,19 @@ class LinearAttentionMixer(nn.Module):
         keys = self.feature_map(keys, self.head_dim)
         # compute linear attention
         # hold on...they seem to do the head-splitting after the feature map.
-        if keys.device.type == "cuda":
-            causal_dot_product = causal_dot_product_cuda
-        else:
-            causal_dot_product = causal_dot_product_cpu
+        #if keys.device.type == "cuda":
+            #causal_dot_product = causal_dot_product_cuda
+        #else:
+            #causal_dot_product = causal_dot_product_cpu
             
         if causal_dot_product is not None: # trying to use the logic from the fast_transformers library
             Z = 1/(torch.einsum("nlhi,nlhi->nlh", queries, keys.cumsum(1)) + self.eps)
             attn = causal_dot_product(
-                queries.permute(0,2,1,3).contiguous(),
-                keys.permute(0,2,1,3).contiguous(),
-                values.permute(0,2,1,3).contiguous()
+                queries.permute(0,2,1,3).contiguous().float(),
+                keys.permute(0,2,1,3).contiguous().float(),
+                values.permute(0,2,1,3).contiguous().float(),
             ).permute(0,2,1,3).contiguous()
+            attn.to(x.dtype)
             attn = attn * Z[:, :, :, None].contiguous()
         else:
             queries, keys, values =  queries.unsqueeze(-2), keys.unsqueeze(-2), values.unsqueeze(-1)
